@@ -1,0 +1,1008 @@
+#!/usr/bin/python3
+
+# $lic$
+# Copyright (C) 2018-2021 by Daniel Sanchez
+#
+# This file is part of the Minispec compiler and toolset.
+#
+# Minispec is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, version 2.
+#
+# Minispec is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <http://www.gnu.org/licenses/>.
+
+# Simple synthesis tool for Minispec and Bluespec circuits
+
+import argparse, ctypes, json, os, re, string, subprocess, sys
+from minispeclayout import MinispecLayout
+
+#### BSV compilation helpers
+
+# Given multi-line input BSV, returns BSV without single or multi-line comments
+def stripComments(input):
+    strippedMultiline = re.sub('\/\*(.*?)\*\/', '', input, flags = re.MULTILINE | re.DOTALL)
+    stripped = re.sub('\/\/(.*?)\n', '\n', strippedMultiline)
+    return stripped
+
+# Parse Bluespec function signature from string.
+# This is simple enough that I don't think we need a full-blown parser.
+def parseBsvFuncStr(funcStr):
+    # Trim provisos and direct defs
+    for breakStr in ["=", "proviso"]:
+        loc = funcStr.find(breakStr)
+        if loc >= 0:
+            funcStr = funcStr[:loc].strip()
+    if funcStr[-1] != ")":
+        print("WARN: Could not parse function %s; (no closing parenthesis)" % funcStr)
+        return None
+    # Find matching open parenthesis denoting start of arguments
+    pos = len(funcStr) - 1
+    try:
+        depth = 0
+        while True:
+            if funcStr[pos] == ")": depth += 1
+            if funcStr[pos] == "(": depth -= 1
+            if depth == 0: break
+            pos -= 1
+    except:
+        print("WARN: Could not parse function %s; (unmatched parentheses)" % funcStr)
+        return None
+
+    # Return type may have whitespace, but function name should be a single word
+    (retType, _, funcName) = funcStr[:pos].strip().rpartition(" ")
+    retType = retType.strip()
+    funcName = funcName.strip()
+    funcArgs = funcStr[pos+1:-1].strip()
+    for (val, name) in [(retType, "return type"), (funcName, "function name"), (funcArgs, "arguments")]:
+        if len(val) == 0:
+            print("WARN: Could not parse function %s; (missing %s)" % (funcStr, name))
+            return None
+
+    # Each arg type / name is parsed just like the return arg / function name
+    argList = []
+    for arg in funcArgs.split(","):
+        (argType, _, argName) = arg.strip().rpartition(" ")
+        if len(argType) == 0:
+            print("WARN: Could not parse arg %s in function %s; (missing type or name)" % (arg, funcStr))
+            return None
+        argList.append((argType, argName))
+
+    return (retType, funcName, argList)
+
+def compileBsvFunction(input, args):
+    targetFunc = None
+    for f in re.finditer(' function (.*?);', input):
+        #print "Identified function", f.group(1)
+        func = parseBsvFuncStr(f.group(1).strip())
+        if not func:
+            continue
+        if func[1] != args.target.strip():
+            continue
+        targetFunc = func
+        break
+
+    if not targetFunc:
+        return False
+
+    (retType, funcName, argList) = targetFunc
+    print("Synthesizing  function %s %s(%s)  from file %s" % (retType, funcName, ", ".join("%s %s" % arg for arg in argList), args.file))
+    methodName = funcName + "_"
+
+    # Produce the synthesis wrapper
+    imports = []
+    # Inherit all imports of the function's file (in case they're needed for e.g., arg or output types)
+    for f in re.finditer(' import .*?;', input):
+        imports.append(f.group(0).strip())
+    # Import the funtion's file
+    imports.append("import " + args.file.rpartition(".")[0].split("/")[-1] + "::*;")
+
+    wrapperTemplate = string.Template(readFile(os.path.join(scriptDir, "synth.bsv")))
+    wrapperData = wrapperTemplate.substitute(
+        IMPORTS = "\n".join(imports),
+        METHOD = "method %s %s(%s);" % (retType, methodName, ", ".join("%s %s" % arg for arg in argList)),
+        FUNCCALL = "%s(%s)" % (funcName, ", ".join(arg[1] for arg in argList)),
+    )
+    wrapperFile = os.path.join(args.synthdir, "synth_" + funcName + ".bsv")
+    writeFile(wrapperFile, wrapperData, "synthesis wrapper")
+
+    print("Compiling Bluespec module")
+    run("bsc -aggressive-conditions +RTS -K16M -RTS -bdir %s -info-dir %s -verilog -u -g mkSynth %s " % (args.synthdir, args.synthdir, wrapperFile))
+    return targetFunc
+
+def compileBsvModule(input, args):
+    # Compiling modules is easier because we do not produce a wrapper.
+    # Instead, we just ensure that the module exists.
+    modName = args.target.strip()
+    found = False
+    for f in re.finditer(' module (.*?)\(', input):
+        name = f.group(1).strip()
+        if name != modName:
+            continue
+        found = True
+        break
+
+    if not found:
+        return False
+
+    print("Synthesizing module %s from file %s" % (modName, args.file))
+    modFile = args.file
+
+    print("Compiling Bluespec module")
+    run("bsc -aggressive-conditions +RTS -K16M -RTS -bdir %s -info-dir %s -vdir %s -show-module-use -verilog -u -g %s %s" % (args.synthdir, args.synthdir, args.synthdir, modName, modFile),
+            "Bluespec compilation failed. Make sure your module is functionally correct.")
+    return True
+
+def sanitizeParametric(p):
+    return p.replace("#", "_").replace(",", "_").replace("(", "").replace(")", "").replace(" ", "").replace("\t", "")
+
+# Thin wrapper around Popen
+def run_outerr(cmd):
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (stdout, stderr) = p.communicate()
+    return (p.returncode, stdout.decode("utf-8"), stderr.decode("utf-8"))
+
+# Runs a command with fail-stop semantics, like make. If the program returns
+# successfully, run() returns stdout; on a failure, run() stops the
+# program.
+def run(cmd, failMsg=None):
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (stdout, stderr) = p.communicate()
+    if p.returncode == 0:
+        return stdout.decode("utf-8")
+    else:
+        print("ERROR: %s failed with error code %d" % (cmd, p.returncode))
+        for line in stderr.decode("utf-8").split("\n"):
+            print("    ", line)
+        if failMsg:
+            print(failMsg)
+        sys.exit(1)
+
+# Async version
+def run_start(cmd, failMsg=None):
+    p = subprocess.Popen(cmd, bufsize=10*1024*1024, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return (p, cmd, failMsg)
+
+def run_finish(rtp):
+    (p, cmd, failMsg) = rtp
+    (stdout, stderr) = p.communicate()
+    if p.returncode == 0:
+        return stdout.decode("utf-8")
+    else:
+        print("ERROR: %s failed with error code %d" % (cmd, p.returncode))
+        for line in stderr.decode("utf-8").split("\n"):
+            print("    ", line)
+        if failMsg:
+            print(failMsg)
+        sys.exit(1)
+
+def run_geterr(rtp):
+    (p, cmd, failMsg) = rtp
+    (stdout, stderr) = p.communicate()
+    if p.returncode != 0:
+        return stderr.decode("utf-8")
+    else:
+        print("ERROR: %s completed successfully when it should have failed" % (cmd,))
+        if failMsg:
+            print(failMsg)
+        sys.exit(1)
+
+# Read data from file with fail-stop semantics
+def readFile(file, descr = None):
+    try:
+        f = open(file, "r")
+        data = f.read()
+        f.close()
+    except:
+        print("Could not read%s file %s" % ((" " + descr) if descr else "", file))
+        sys.exit(1)
+    return data
+
+# Writes data to file with fail-stop semantics
+def writeFile(file, data, descr):
+    try:
+        f = open(file, "w")
+        f.write(data)
+        f.close()
+    except:
+        print("Could not write to %s file %s" % (descr, file))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Simple synthesis tool for Minispec or Bluespec circuits')
+    parser.add_argument("file", help="Minispec(.ms) or BSV(.bsv) file containing the function or module to synthesize")
+    parser.add_argument("target", help="Name of the function or module to synthesize")
+    parser.add_argument("--lib", "-l", default="basic", help="Standard cell library to use (basic, extended, multisize, or full)")
+    parser.add_argument("--delay", "-d", type=int, default=1, help="Target propagation delay (critical-path delay) in picoseconds. If unspecified, minimizes delay.")
+    parser.add_argument("--optLevel", "-O", type=int, default=1, help="Optimization level. -O0 disables optimization, while -O1 performs fixed logic optimization passes.")
+    parser.add_argument("--synthdir", "-s", default="synthDir", help="Folder for intermediate synthesis files")
+    parser.add_argument("--view", "-v", default=False, action="store_true", help="Visualize resulting circuit (not available with full standard cell library)")
+    parser.add_argument("--interface", "-i", default=False, action="store_true", help="Report full interface (input and output wires) of synthesized module (available only for Minispec)")
+    parser.add_argument("--paths", "-p", type=int, default=0, help="Report the N longest paths in the circuit")
+    parser.add_argument("--names", "-n", default=False, action="store_true", help="Try to recover net names for gate outputs in the critical path (experimental, takes longer)")
+    parser.add_argument("--rawnames", default=False, action="store_true", help="For Minispec circuits, skip type analysis and report raw wire names (type-enhanced wire names will be clearer, but this can be useful for debugging)")
+    parser.add_argument("--retime", "-r", default=False, action="store_true", help="Enable retiming")
+    args = parser.parse_args()
+
+    if args.names and args.retime:
+        print("ERROR: Options --names/-n and --retime/-r cannot be simultaneously enabled.")
+        sys.exit(1)
+
+    scriptDir = os.path.dirname(os.path.realpath(sys.argv[0]))
+
+    if not os.path.exists(args.synthdir):
+        print("Creating synthesis directory")
+        os.makedirs(args.synthdir)
+    else:
+        # Clean up all files, as multi-module builds sometimes get stale data otherwise
+        run("rm -rf %s/*" % (args.synthdir,))
+
+    # Find BSV library path by asking bsc directly (so this works without $BLUESPECDIR and with symlinks)
+    bscArgs = run("bsc -print-flags", failMsg = "Bluespec compiler cannot run (is it in your $PATH?)")
+    bsvBaseLibPath = bscArgs.split("  -i ")[1].split("\n")[0].strip()
+    bsvLibPath = os.path.join(bsvBaseLibPath, "Verilog")
+    if not os.path.exists(bsvLibPath):
+        print("Found Bluespec compiler, but component library is not at %s. Do you have a non-standard Bluespec installation?" % (bsvLibPath,))
+        sys.exit(1)
+
+    # Since we run async subprocesses, set PDEATHSIG so we don't leave stray
+    # children behind if we die. FIXME: Maximally non-portable hack. Wrapped in
+    # a try-block for that reason...
+    try:
+        libc = ctypes.cdll.LoadLibrary('libc.so.6')
+        libc.prctl(1, 15) # PR_SET_PDEATHSIG, SIGTERM
+    except:
+        print("WARN: Could not prctl()")
+
+    isMinispec = args.file.endswith(".ms")
+    isModule = False
+    if isMinispec:
+        # Minispec: just use msc output
+        isModule = args.target[0].isupper()
+        print("Compiling %s %s from file %s" % ("module" if isModule else "function", args.target, args.file))
+        run("(cd %s && msc -o v,bsv --bscOpts ' -opt-undetermined-vals -unspecified-to X ' '%s' '%s')" % (args.synthdir, os.path.abspath(args.file), args.target))
+        modName = "mk" + args.target.strip() if "#" not in args.target else "mkTopLevel___"
+    else:
+        # Bluespec
+        input = readFile(args.file, "input file")
+
+        # Use a single-line string to avoid dealing with multi-line regex/parsing.
+        # Leading space guarantees that all function defs start with a space, so we can
+        # use a simple regex on " function" instead of distinguishing function and
+        # endfunction. Same deal for module/endmodule.
+        input = " " + stripComments(input).replace("\n", " ")
+
+        if compileBsvModule(input, args):
+            isModule = True
+        else:
+            targetFunc = compileBsvFunction(input, args)
+            if not targetFunc:
+                print("Target (function/module) %s not found in %s" % (args.target, args.file))
+                sys.exit(1)
+            (_, _, _) = targetFunc
+        modName = args.target.strip() if isModule else "mkSynth"
+
+    stdcellFile = os.path.join(scriptDir, args.lib + ".lib")
+    if not os.path.exists(stdcellFile):
+        print("ERROR: Standard cell library", args.lib, "does not exist")
+        sys.exit(1)
+
+    vizLibs = ["basic", "extended", "multisize"]
+    vizLibsStr = ", ".join(vizLibs[:-1]) + ", and " + vizLibs[-1]
+    if args.view and args.lib not in vizLibs:
+        print("ERROR: Visualization is only available with the %s standard cell libraries (you selected '%s')" % (vizLibsStr, args.lib))
+        sys.exit(1)
+
+    postCmds = ""
+    verilogStdcellFile = os.path.join(scriptDir, "singlesize.v" if args.lib in ["basic", "extended"] else "multisize.v")
+    if args.view:
+        postCmds = "read_verilog %s\nwrite_json %s" % (verilogStdcellFile, "$OUTDIR/synth.json")
+
+    if args.delay <= 0:
+        print("ERROR: FTL logic not available, specify a positive target delay")
+        sys.exit(1)
+
+    # Produce synthesis scripts
+    # ABC common resyn optimization aliases:
+    resyn = "balance;rewrite;rewrite -z;balance;rewrite -z;balance;"
+    resyn2 = "balance;rewrite;refactor;balance;rewrite;rewrite -z;balance;refactor -z;rewrite -z;balance;"
+    resyn3 = "balance; resub; resub -K 6; balance; resub -z; resub -z -K 6; balance; resub -z -K 5; balance;"
+    recadd3 = "strash; rec_add3; balance; rec_add3; dc2; rec_add3; if -K 8; bidec; strash; rec_add3; dc2; rec_add3; if -g -K 6; strash; rec_add3;"
+
+    if args.optLevel == 0:
+        # -O0: No optimization other than balancing XOR trees (balance -x).
+        optCfgs = [("ox", "balance -x")]
+    elif args.optLevel == 1:
+        # -O1: Gentle optimization, balances XOR trees well, generally outperforms -O0,
+        # does not change algorithmic tradeoffs (e.g., won't turn a non-trivial chain
+        # like in a ripple-carry adder into a tree by doing parallel prefix sum).
+        #
+        # NOTE: balance -x added at middle-end to avoid imbalanced XOR trees (try a
+        # 256-input XOR without it...) and at the same time leave enough room for
+        # later passes to optimize if balance -x doesn't do so well (balance -x last
+        # sometimes produces non-negligible diffs in large designs, e.g., +15-20ns in
+        # a pipelined RISC-V processor with a ~250ns critical path).
+        #
+        # Since -O0 params occasionally outperform -O1 (esp. on small circuits), include both
+        optCfgs = [("ox", "balance -x"), ("ob", resyn + "if -x;" + resyn2 + "if -x;balance -x;" + resyn2)]
+    else:
+        print("ERROR: Optimization level can be 0 or 1 only, specified invalid value %d" % args.optLevel)
+        sys.exit(-1)
+
+    # -O2 candidate: More serious optimization, obscures algorithmic tradeoffs; apply with care
+    # NOTE: If we ever do -O2, we should do an iterative optimization process, trying resyn etc. and building an optimization string over time,
+    # optimizing our way to some local minimum. Otherwise, these more complex sequences of passes have really odd behaviors (e.g., being worse than simple for some inputs, etc.)
+    #abcBaseData = "strash;fraig;refactor;balance;rewrite;refactor;balance;rewrite -z;balance;logic;sop;strash;refactor;balance;rewrite;rewrite -z;refactor -z;balance;logic;sop;strash;refactor;balance;rewrite;if -g -K 8;rewrite -z;refactor -z;balance;logic;sop;strash;refactor;balance;rewrite;rewrite -z;refactor -z;balance;logic;sop;strash;if -g -K 12;refactor;balance;rewrite;rewrite -z;refactor -z;balance;rewrite -z;refactor -z;balance;logic;sop;strash;refactor;balance;rewrite;rewrite -z;refactor -z;balance;logic;sop;strash;if -g -K 8;refactor;balance;rewrite;rewrite -z;refactor -z;balance;rewrite -z;refactor -z;balance;logic;sop;strash;refactor;balance;rewrite;rewrite -z;refactor -z;balance;logic;sop;strash;if -g -K 8;refactor;balance;rewrite;if -x -K 12;rewrite -z;refactor -z;balance;if -y -K 6;refactor;balance;rewrite;rewrite -z;refactor -z;balance;" #+ resyn + "if -x -K 16;" + resyn2
+
+    abcBaseData = "strash;$OPT;ifraig;map -D $DELAY -B 0.1;cleanup;$BUFFER;upsize -D $DELAY;dnsize -D $DELAY;stime -p;"
+    if args.paths != 0:
+        abcBaseData += "stime -a;"
+    # NOTE: Removed dretime as it produced worse QoR; using retime -M4 which is just delay-optimal
+    # TODO: Try retiming after mapping/$BUFFER/sizing. It seems to produce slightly better results,
+    # however the 2nd call to ABC needs absolutely no buffers, so you need to follow a late retime
+    # with yet another map (or strash + map).
+    abcSeqBaseData = "strash;$OPT;fraig;scorr;retime -D $DELAY -M 4;map -D $DELAY -B 0.1;cleanup;"
+
+    # Find all files to read
+    readVerilogCmds = ["read_verilog " + os.path.join(args.synthdir, "*.v")]
+    modpaths = {}
+    for file in os.listdir(args.synthdir):
+        if file.endswith(".use"):
+            mods = readFile(os.path.join(args.synthdir, file))
+            for mod in mods.split("\n"):
+                if mod in modpaths: continue
+                if "BRAM" in mod or "Load" in mod: continue
+                modpath = os.path.join(bsvLibPath, mod.strip() + ".v")
+                if os.path.exists(modpath):
+                    modpaths[mod] = modpath
+    for mod in modpaths:
+        readVerilogCmds.append("read_verilog " + modpaths[mod])
+
+    yosysTemplate = string.Template(readFile(os.path.join(scriptDir, "synth_seq.ys" if args.retime else "synth.ys")))
+    yosysBaseData = yosysTemplate.safe_substitute(
+        READVERILOGCMDS = "\n".join(readVerilogCmds),
+        SYNTHDIR = args.synthdir,
+        MODNAME = modName,
+        DELAY = str(args.delay),
+        STDCELLFILE = stdcellFile,
+        VERILOGSTDCELLFILE = verilogStdcellFile,
+        CONSTRFILE = os.path.join(scriptDir, "singlesize.constr" if args.lib in ["basic", "extended"] else "synth.constr"),
+        POST = postCmds
+    )
+
+    print("Synthesizing circuit with std cell library = %s, O%d, target delay = %d ps" % (args.lib, args.optLevel, args.delay))
+
+    # Buffer insertion is not delay-aware and finicky, so synthesize the circuit using a few settings and pick the best
+    bufferCfgs = [("nb", ""), ("b", "buffer"), ("b50", "buffer -N 50")]
+    yosysOutFile = lambda outDir: os.path.join(outDir, "yosys.out")
+
+    # We run all yosys instances in parallel, as they take little memory
+    def runYosys_start(outDir, optCmd, bufferCmd):
+        run("mkdir -p " + outDir)
+
+        yosysFile = os.path.join(outDir, "synth.ys")
+        yosysData = string.Template(yosysBaseData).substitute(
+            OUTDIR = outDir,
+        )
+        writeFile(yosysFile, yosysData, "yosys script")
+
+        def genAbcScript(baseData, filename):
+            abcFile = os.path.join(outDir, filename)
+            abcData = string.Template(baseData).substitute(
+                OPT = optCmd,
+                BUFFER = bufferCmd,
+                DELAY = str(args.delay),
+                OUTDIR = outDir,
+            )
+            abcData = "\n".join(["echo + %s\n%s" % (cmd, cmd) for cmd in abcData.split(";")])
+            writeFile(abcFile, abcData, "abc script")
+
+        genAbcScript(abcBaseData, "abc.script")
+        if args.retime:
+            genAbcScript(abcSeqBaseData, "abc_seq.script")
+
+        return (run_start("yosys %s > %s" % (yosysFile, os.path.join(outDir, "yosys.out"))), outDir)
+
+    def runYosys_finish(pd):
+        (p, outDir) = pd
+        run_finish(p)
+        (retcode, abcOut, abcErr) = run_outerr("grep 'ABC: WireLoad' " + yosysOutFile(outDir))
+        if retcode != 0:
+            (retcode, abcOut, abcErr) = run_outerr('grep "Don\'t call ABC as there is nothing to map." ' + yosysOutFile(outDir))
+            print((retcode, abcOut, abcErr))
+            if retcode == 0:
+                return ("0", "0", outDir)
+            else:
+                print("ERROR: Yosys output does not contain timing and area analysis")
+                sys.exit(1)
+
+        match = re.search('ABC: WireLoad = "none" (.*)', abcOut)
+        if not match:
+            print("ERROR: Yosys output does not contain timing and area analysis, but grep didn't fail?")
+            sys.exit(1)
+
+        #print match.group(1)
+        summaryLine = match.group(1)
+        delay = re.search("Delay = (.*?) ps", summaryLine).group(1).strip()
+        area = re.search("Area = (.*?) \(", summaryLine).group(1).strip()
+        return (delay, area, outDir)
+
+    if args.names:
+        # We leverage ABC's dress command to map internal cell names back to
+        # those of the input net.
+
+        # 1. Get the input blif file (by crashing ABC on purpose, so yosys
+        # doesn't delete it... geeeez)
+        (p, _) = runYosys_start(os.path.join(args.synthdir, "yosys_input"), "", "thiswillfail;")
+        errMsg = run_geterr(p)
+        tmpOutBlif = re.search("Can't open ABC output file `(.*?)'", errMsg).group(1).strip()
+        tmpInBlif = tmpOutBlif.replace("output.blif", "input.blif")
+        inBlifFile = os.path.join(args.synthdir, "input.blif")
+
+        # 2. Rename all the nodes so that they start with a different prefix.
+        # This is because, when dressing later, we don't want unmatched nets to
+        # have hames that were also in the input blif file.
+        run("sed -r 's/n([[:digit:]]+)/k\\1/g' %s > %s" % (tmpInBlif, inBlifFile))
+
+        # 3. Add dressing to ABC. Because dress removes gate info, we need to
+        # dress, save, then reload the undressed netlist (so that yosys gets
+        # the right output)
+        abcBaseData += "write_blif $OUTDIR/postmap.blif;move_names %s; dress %s;write_blif $OUTDIR/postmap-dressed.blif;empty;read_blif $OUTDIR/postmap.blif;" % (inBlifFile,inBlifFile)
+
+    procs = []
+    for (optSuffix, optCmd) in optCfgs:
+        for (bufferSuffix, bufferCmd) in bufferCfgs:
+            outDir = os.path.join(args.synthdir, "yosys_%s_%s" % (optSuffix, bufferSuffix))
+            procs.append(runYosys_start(outDir, optCmd, bufferCmd))
+
+    results = []
+    for p in procs:
+        (delay, area, outDir) = runYosys_finish(p)
+        results.append((float(delay), float(area), outDir))
+    results.sort()
+
+    if results[0][0] == 0.0 and results[0][1] == 0.0:
+        print("WARNING: Synthesized circuit has no logic; synthesis done")
+        # TODO: Refactor code so that we can print circuit if args.view
+        sys.exit(0)
+
+    if results[0][0] >= args.delay:
+        # If all designs above delay target, pick the smallest one
+        yosysOutDir = results[0][2]
+    else:
+        # Pick smallest-area design that meets delay target
+        candidates = sorted([(area, delay, outDir) for (delay, area, outDir) in results if delay <= args.delay])
+        yosysOutDir = candidates[0][2]
+
+    #print results, yosysOutDir
+    yosysOut = readFile(yosysOutFile(yosysOutDir))
+
+    # Parse the relevant components
+    match = re.search('ABC: WireLoad = "none" (.*?) write_blif', yosysOut, flags = re.MULTILINE | re.DOTALL)
+    if not match:
+        print("ERROR: Yosys output does not contain timing and area analysis")
+        sys.exit(1)
+    anlLines = match.group(1).split("\n")
+
+    summaryLine = anlLines[0]
+    pathLines = []
+    pointsLine = None
+    for line in anlLines[1:]:
+        if line.startswith("ABC: Path"):
+            pathLines.append(line)
+        else:
+            pointsLine = line
+            break
+    assert pointsLine
+
+    gates = re.search("Gates = (.*?) \(", summaryLine).group(1).strip()
+    delay = re.search("Delay = (.*?) ps", summaryLine).group(1).strip()
+
+    startPoint = re.search("Start-point = (.*?) \((.*?)\)", pointsLine).group(2).strip()
+    endPoint = re.search("End-point = (.*?) \((.*?)\)", pointsLine).group(2).strip()
+
+    if not isModule:
+        # Function name demangling
+        # Drop leading \ and module prefix __
+        bsvStartPoint = startPoint.strip()[3:].replace(" ", "")
+
+        # Drop leading \
+        trimmedEndPoint = endPoint.strip()[1:].replace(" ", "")
+        bsvEndPoint = trimmedEndPoint
+        if not trimmedEndPoint.startswith("out"):
+            # Time to rummage through the BLIF output!
+            f = open(os.path.join(yosysOutDir, "out.blif"), "r")
+            for line in f:
+                if line.startswith(".names"):
+                    sigs = [s.strip() for s in line.split(" ")]
+                    outName = None
+                    match = False
+                    # Note the code scans all .names entries looking for **full**
+                    # matches. We don't just search for the internal end-point name
+                    # because sometimes there's a different signal name of which
+                    # the end-point name is a substring.
+                    for s in sigs:
+                        if s.startswith("out["):
+                            outName = s
+                        if s == trimmedEndPoint:
+                            match = True
+                    if match and outName:
+                        bsvEndPoint = outName
+                        break
+            f.close()
+    else:
+        # Module name demangling. State elements are easy, but outputs we
+        # really can't do anything about. The good news is that outputs just
+        # take the name of their method, as far as I can see. Also, inputs are
+        # methodName_argName, but the arg name is from the interface.
+
+        if "dfflibmap" in startPoint:
+            # This is probably the negated output of a DFF
+            blif = readFile(os.path.join(yosysOutDir, "out.blif")).replace("\n", " ")
+            m = re.search("Q=(\S+)\s+QN=" + re.escape(startPoint), blif)
+            if m:
+                bsvStartPoint = "~" + m.group(1)
+            else:
+                bsvStartPoint = startPoint
+        else:
+            # Drop leading \
+            bsvStartPoint = startPoint.strip()[1:].replace(" ", "")
+
+        bsvEndPoint = endPoint.strip().replace(" ", "").replace("\\", "")
+        if bsvEndPoint.startswith("$0"):
+            # State element
+            bsvEndPoint = bsvEndPoint[2:] + "(DFF_in)"
+
+    msLayout = None
+    if isMinispec and not args.rawnames:
+        bsvFile = [f for f in os.listdir(args.synthdir) if f.endswith(".bsv")][0]
+        bsvCode = readFile(os.path.join(args.synthdir, bsvFile))
+        msLayout = MinispecLayout(bsvCode, modName)
+        bsvStartPoint = msLayout.translate(bsvStartPoint)
+        bsvEndPoint = msLayout.translate(bsvEndPoint)
+
+    match = re.search('Printing statistics.(.*?)Executing BLIF backend.', yosysOut, flags = re.MULTILINE | re.DOTALL)
+    if not match:
+        print("ERROR: Yosys output does not contain timing and area analysis")
+        sys.exit(1)
+
+    # Parse areas directly from lib file
+    cellAreas = {}
+    f = open(stdcellFile, 'r')
+    curCell = None
+    for l in f:
+        line = l.strip()
+        if line.startswith("cell (") and line.endswith(") {"):
+            assert curCell == None
+            curCell = line[6:-3]
+        elif line.startswith("area") and line.endswith(";"):
+            assert curCell != None
+            cellArea = float(line[:-1].split(":")[-1].strip())
+            cellAreas[curCell] = cellArea
+            curCell = None
+    f.close()
+
+    # Compute total gates and areas from yosys, since ABC does not include flip-flops
+    statLines = match.group(1).split("\n")
+    cellLines = statLines[12:-2]
+    totalGateArea = 0.0
+    totalCells = 0
+    cellStats = []
+    for l in cellLines:
+        cellName = l[:-9].strip()
+        cellCount = int(l[-9:].strip())
+        cellArea = cellAreas[cellName] if cellName in cellAreas else 0.0
+        typeArea = cellArea * cellCount
+        totalGateArea += typeArea
+        totalCells += cellCount
+        cellStats.append((cellName, cellCount, cellArea, typeArea))
+
+    # Parse the resulting verilog file to see whether we have any BRAMs
+    brams = []
+    valToInt = lambda v : int(v.split("d")[-1]) if "d" in v else 0
+    if isModule:
+        verilog = readFile(os.path.join(yosysOutDir, "out.verilog")).replace("\n", " ")
+        for m in re.finditer(' BRAM(.*?) #\( (.*?)   \) (.*?) \(', verilog):
+            suffix = m.group(1).strip()
+            params = m.group(2)
+            name = m.group(3).strip()
+            words = 0
+            wordsize = 0
+            for p in re.finditer('\.(.*?)\((.*?)\)', params):
+                param = p.group(1).strip()
+                value = p.group(2).strip()
+                if param == "ADDR_WIDTH": words = 2 ** valToInt(value)
+                if param == "DATA_WIDTH": wordsize = valToInt(value)
+            name = name.replace("_bram", "")
+            brams.append((name, words, wordsize))
+    if len(brams):
+        # Finally, take the BRAMs out of the area report if the total counts match
+        bramCells = sum([cellCount for (cellName, cellCount, cellArea, typeArea) in cellStats if cellName.startswith("BRAM")])
+        if bramCells == len(brams):
+            cellStats = [c for c in cellStats if not c[0].startswith("BRAM")]
+
+    totalBramBits = sum([words * wordsize for (name, words, wordsize) in brams])
+    # Estimated using 45nm CACTI and a sweep of 2-4KB memories with widths
+    # of 1-32 bits; reported Intel raw cell size is 0.346um^2 at 45nm, so
+    # this is a resonable efficiency
+    areaPerBit = 0.412
+    totalBramArea = totalBramBits * areaPerBit
+
+    print("\nGates:", totalCells)
+    print("Area: %.2f um^2" % (totalGateArea + totalBramArea,))
+    print("Critical-path delay:", delay, ("ps" if not isModule else "ps (not including setup time of endpoint flip-flop)"))
+
+    print("\nCritical path: %s -> %s" % (bsvStartPoint, bsvEndPoint))
+
+    if args.names:
+        # The works: Parse input, undressed, and dressed BLIF files to map
+        # internal wires to Verilog/BSV variable names
+
+        # First, the var to input mapping
+        lines = run("grep '^# k' " + inBlifFile).split("\n")
+        inNodeToVar = [None] * len(lines)
+        for line in lines:
+            if len(line) == 0: continue
+            m = re.search("# k([0-9]+)\s+(.*)", line)
+            #print line, m, m.group(2)
+            inNodeToVar[int(m.group(1))] = m.group(2)
+
+        # Then, the dressed to undressed mapping
+        # The undressed, postmap BLIF file is techmapped with one line per gate.
+        # The gate output (Z/ZN) is last in the line. All gates have a single
+        # output. This output id corresponds to the id shown in ABC's timing
+        # report, but it's unrelated to the input's.
+        # The postmap-dressed BLIF file uses ABC's dress command to rename whatever
+        # variables it can to input names using a SAT solver. Not all input names
+        # have a match. dress transforms the BLIF file into a logic format (no
+        # gates), which is why we can't just call dress from ABC and have the right
+        # ids in the timing report. Fortunately, dress leaves one entry per gate in
+        # the same order as the undressed file.
+        outNodeToVar = {}
+        undressedLines = run("grep '^.gate ' " + os.path.join(yosysOutDir, "postmap.blif")).split("\n")
+        dressedLines = run("grep '^.names ' " + os.path.join(yosysOutDir, "postmap-dressed.blif")).split("\n")
+        assert len(undressedLines) == len(dressedLines)
+        unmatched = 0
+
+        undressedBlif = readFile(os.path.join(yosysOutDir, "postmap.blif")).replace("\n", " ")
+        m = re.search("\.inputs(.*?)\.outputs(.*?)\.", undressedBlif)
+        parsePorts = lambda s: s.strip().replace("\\", "").split()
+        undressedPorts = set(parsePorts(m.group(1)) + parsePorts(m.group(2)))
+
+        print(yosysOutDir)
+        for (uLine, dLine) in zip(undressedLines, dressedLines):
+            #print uLine, dLine
+            if len(uLine) == 0: continue
+
+            outNode = uLine.split("=n")[-1].strip()
+            if ("n" + outNode) in undressedPorts:
+                # Easy case: Ports are preserved, e.g., undressed port nXXX
+                # maps to dressed kXXX. However, not much to do here, as it
+                # looks like for critical path reporting, ports are in a
+                # different namespace (pi/po), so node ids don't match the nXXX
+                # ids. Plus we don't care, we're already reporting port names.
+                inIdx = int(outNode)
+                #print "Skipping output", inIdx
+                assert inIdx < len(inNodeToVar)
+                continue
+
+            if outNode.endswith("_1"):
+                # This is a name conflict with an input/output port. The idx
+                # still matches though.
+                outNode = outNode.split("_")[0]
+
+            outIdx = int(outNode)
+
+            inNode = dLine.strip().split()[-1]
+            m = re.search("k([0-9]+)(.*)", inNode.strip())
+            #print outIdx, dLine, inNode, m
+            if m == None:
+                unmatched += 1
+                continue
+            inIdx = int(m.group(1))
+            inSuffix = m.group(2)
+            if inSuffix == "" and inIdx < len(inNodeToVar):
+                # Non-inverted match
+                outNodeToVar[outIdx] = inNodeToVar[inIdx]
+            elif inSuffix == "_inv":
+                # Inverted match
+                assert inIdx < len(inNodeToVar)
+                outNodeToVar[outIdx] = "~" + inNodeToVar[inIdx]
+            else:
+                unmatched += 1
+        print("Name mapping done, %d matched / % d unmatched" % (len(outNodeToVar), unmatched))
+
+    def printCols(widths, *vals):
+        assert len(widths) == len(vals)
+        overage = 0
+        line = ""
+        for i in range(len(widths)):
+            w = widths[i]
+            s = str(vals[i])
+            spaces = max(0, w - len(s))
+            spaces -= min(spaces, overage)
+            overage = overage + spaces + len(s) - w
+            if i > 0:
+                spaces += 1 # inter-col spacing
+            line += " " * spaces + s
+        print(line)
+
+    # Formats for each of the reports
+    def printTiming(*vals):
+        printCols((24, 8, 22, 22, 0), *vals)
+
+    def printPath(*vals):
+        printCols((33, 22, 22), *vals)
+
+    def printArea(*vals):
+        printCols((24, 8, 22, 22), *vals)
+
+    def printMem(*vals):
+        printCols((24, 8, 10, 11, 22), *vals)
+
+    def printInterface(*vals):
+        printCols((33, 22, 22), *vals)
+
+    def formatName(name):
+        if name.startswith("~"):
+            inv = True
+            name = name[1:]
+        else:
+            inv = False
+
+        if name.startswith("$"):
+            if name.startswith("$procmux"):
+                return "(mux)"
+            else:
+                return ""
+        name = name.replace(" ", "").replace("\\", "")
+        if inv:
+            name = "~" + name
+        return name
+
+    # Print a cleaned up critical path
+    cumDelay = 0.0
+    printTiming('Gate/port', 'Fanout' , 'Gate delay (ps)', 'Cumulative delay (ps)', 'Gate output name' if args.names else '')
+    printTiming('---------', '------' , '---------------', '---------------------', '----------------' if args.names else '')
+    lineNum = 0;
+    for line in pathLines:
+        #ABC: Path  1 --     232 : 1    8 BUF_X4   A =   1.86  Df =  22.1   -1.1 ps  S =   7.2 ps  Cin =  3.3 ff  Cout =  16.7 ff  Cmax = 242.3 ff  G =  478
+        #m = re.search("--\s+(\d+)\s?:\s?\d+\s+(\d+)\s+(\S+).*Df =([0-9.]+)\s?ps", line)
+        m = re.search("\s+(\d+)\s?:\s?\d+\s+(\d+)\s+(\S+).*?Df =(.*?)ps", line)
+        outNode = int(m.group(1))
+        fanout = int(m.group(2))
+        gateName = m.group(3)
+        newCumDelay = float(m.group(4).strip().split()[0])
+
+        tpd = newCumDelay - cumDelay
+        cumDelay = newCumDelay
+
+        outName = formatName(outNodeToVar[outNode]) if args.names and outNode in outNodeToVar else ""
+        if (lineNum == 0) :
+            gateName = bsvStartPoint
+        printTiming(gateName, fanout, "%.1f" % tpd, "%.1f" % cumDelay, outName)
+        lineNum += 1
+    printTiming(bsvEndPoint, 0, "%.1f" % 0.0, "%.1f" % cumDelay, "")
+
+    if args.paths != 0:
+        # NOTE: For now, this analysis is independent of the normal
+        # critical-path report b/c it depends on gathering more info, which can
+        # get expensive, and because we're relying on a patched ABC. but
+        # there's a fair amount of duplication. Merge/dedup things eventually!
+        match = re.search('\+ stime -a (.*?) \+ write_blif', yosysOut, flags = re.MULTILINE | re.DOTALL)
+        if match == None:
+            print("ERROR: Path analysis not available")
+        else:
+            delayInfo = dict([(node, (delay, critFi, fos.strip())) for (delay, node, critFi, fos) in
+                re.findall("Dr =\s+(\S+).+?Name =\s+(\S+)\s+CritFI =\s+(\S+)\s+FOs =(.*)",
+                    match.group(1))])
+            if len(delayInfo) == 0:
+                print("ERROR: Node/CritFI/FOs info not available from ABC; make sure you're using a patched version of yosys-abc suitable for synth!")
+            else:
+                # Find inputs and outputs (in the ABC sense, i.e., including
+                # things ABC didn't see, like DFF and BRAM interfaces)
+                abcInputs = {}
+                abcOutputs = {}
+                for (node, (delay, critFi, fos)) in delayInfo.items():
+                    if critFi not in delayInfo:
+                        abcInputs[critFi] = node
+                    for fo in fos.split(" "):
+                        if fo not in delayInfo:
+                            abcOutputs[fo] = node
+
+                blif = readFile(os.path.join(yosysOutDir, "out.blif"))
+                synonyms = re.findall(".names (\S+) (\S+)", blif)
+
+                # Find the ABC node name for every non-ABC node name.
+                # Requires multiple passes due to non-ABC synonyms
+                nameToAbc = {}
+                leftovers = []
+                for (n1, n2) in synonyms:
+                    if n1.startswith("$abc"):
+                        (n2, n1) = (n1, n2)
+                    if not n2.startswith("$abc"):
+                        leftovers.append((n1, n2))
+                    else:
+                        (_, _, abcName) = n2.rpartition("$")
+                        nameToAbc[n1] = abcName
+                # Transitively get all non-ABC synonyms
+                while len(leftovers) > 0:
+                    nextLeftovers = []
+                    for (n1, n2) in leftovers:
+                        if n1 in nameToAbc:
+                            nameToAbc[n2] = nameToAbc[n1]
+                        elif n2 in nameToAbc:
+                            nameToAbc[n1] = nameToAbc[n2]
+                        else:
+                            nextLeftovers.append((n1, n2))
+                    if len(nextLeftovers) == len(leftovers):
+                        break # this gets rid of useless mappings, e.g., RDY signals to $true
+                        #print "ERROR: Path analysis: Incomplete BLIF output??"
+                        #sys.exit(-1)
+                    leftovers = nextLeftovers
+
+                # Gather the canonical I/O names for the purpose of prioritization
+                bm = re.search("\.inputs (.*)\n\.outputs (.*)\n", blif)
+                inputs = set(bm.group(1).strip().split(" "))
+                outputs = set(bm.group(2).strip().split(" "))
+                # Also consider DFF I/Os (as they are I/Os from ABC's perspective)
+                dffInputs = set()
+                dffOutputs = set()
+                for (d, q, qn) in re.findall(".subckt DFF.*?D=(\S+)\s+Q=(\S+)\s+QN=(\S+)", blif):
+                    if d in nameToAbc:
+                        dffOutputs.add(d)
+                    if q in nameToAbc:
+                        dffInputs.add(q)
+                    if qn in nameToAbc:
+                        dffInputs.add(qn)
+
+                # Sometimes a node has mutiple names. Prioritize names as follows:
+                def prio(name, isInput):
+                    if (isInput and name in inputs) or (not isInput and name in outputs):
+                        return 4 # right name for sure
+                    if "__h" in name[1:] or "__d" in name[1:] or "__q" in name[1:]:
+                        return 0 # internal node names
+                    if "$D_IN" in name:
+                        return 1 # Sometimes DFF inputs get this name, we want ...(DFF_in) name though
+                    if "$wget" in name:
+                        return 1 # An internal wire name; prefer internal interface over this
+                    if "$auto" in name:
+                        return 1 # Created by some internal process, definitely internal...
+                    if (isInput and name in dffInputs) or (not isInput and name in dffOutputs):
+                        return 3 # generally the right one, BUT sometimes yosys picks an internal node, so this check is after
+                    return 2 # probably part of an internal interface, e.g., a BRAM
+
+                inNets = {}
+                outNodes = {}
+                for (name, abcName) in nameToAbc.items():
+                    if abcName in abcInputs:
+                        if abcName not in inNets or prio(inNets[abcName], True) < prio(name, True):
+                            inNets[abcName] = name
+                    elif abcName in abcOutputs:
+                        abcNodeName = abcOutputs[abcName]
+                        if abcNodeName not in outNodes or prio(outNodes[abcNodeName], False) < prio(name, False):
+                            outNodes[abcNodeName] = name
+
+                critOuts = list(reversed(sorted([(float(delay), net) for (net, (delay, _, _))
+                    in delayInfo.items() if net in outNodes])))
+                if args.paths > 0 and args.paths < len(critOuts):
+                    critOuts = critOuts[:args.paths]
+
+                print("\nLongest paths:")
+                printPath("Start", "End", "Delay")
+                printPath('-----', '---', '-----')
+                for (delay, out) in critOuts:
+                    outName = outNodes[out]
+                    cur = out
+                    while cur in delayInfo:
+                        cur = delayInfo[cur][1]
+                    inName = inNets[cur] if cur in inNets else cur
+                    if not isModule and cur in inNets:
+                        inName = inName[2:] # drop leading __
+                    if outName.startswith("$0\\"):
+                        outName = outName[3:] + "(DFF_in)"
+                    if msLayout != None:
+                        inName = msLayout.translate(inName)
+                        outName = msLayout.translate(outName)
+                    printPath(inName, outName, "%.1f" % delay)
+
+    if len(brams):
+        print("\nArea breakdown (excluding memories):")
+    else:
+        print("\nArea breakdown:")
+    printArea("Gate type", "Gates" , "Area/gate (um^2)", "Area/type (um^2)")
+    printArea("---------", "-----" , "----------------", "----------------")
+    for (cellName, cellCount, cellArea, typeArea) in cellStats:
+        # Skip BVI/External modules (we add them to the interface)
+        if msLayout != None and msLayout.isBvi(cellName):
+            continue
+        if cellArea == 0.0:
+            printArea(cellName, cellCount, "Unknown", "Unknown")
+        else:
+            printArea(cellName, cellCount, "%.3f" % cellArea, "%.3f" % typeArea)
+    printArea("Total", totalCells, "", "%.3f" % totalGateArea)
+
+    if len(brams):
+        print("\nMemories used:")
+        printMem("Name", "Words" , "Word bits", "Total bits", "Approx. Area (um^2)")
+        printMem("----", "-----" , "---------", "----------", "-------------------")
+        for (name, words, wordsize) in sorted(brams):
+            bits = words * wordsize
+            printMem(name, words, wordsize, bits, "%.3f" % (bits * areaPerBit))
+        printMem("Total", "", "", totalBramBits, "%.3f" % totalBramArea)
+
+    if args.interface and msLayout == None:
+        print("ERROR: Cannot report circuit interface (-i/--interface option) because type analysis information is unavailable; Either this is not a Minispec circuit, or type analysis was turned off (e.g., through --rawnames)")
+    elif args.interface:
+        def printIOs(ioDict):
+            printInterface("Name", "Type" , "Bits")
+            printInterface("----", "----" , "----")
+            totalBits = 0
+            totalBitsUnknown = False
+            for (name, type) in sorted(ioDict.items()):
+                bits = msLayout.getWidth(type)
+                bitsStr = str(bits)
+                if bits == -1:
+                    bitsStr = "Unknown"
+                    totalBitsUnknown = True
+                totalBits += bits
+                printInterface(name, type, bitsStr)
+            totalBitsStr = "Unknown" if totalBitsUnknown else str(totalBits)
+            printInterface("Total", "", totalBitsStr)
+
+        print("\nCircuit inputs:")
+        printIOs(msLayout.inputs)
+        print("\nCircuit outputs:")
+        printIOs(msLayout.outputs)
+
+    if args.view:
+        # Remove needless ports and use BSV names for inputs (drop module prefix)
+        jsonFile = os.path.join(yosysOutDir, "synth.json")
+        f = open(jsonFile, "r")
+        data = json.load(f)
+        f.close()
+        if not isModule:
+            # Demangle inputs/outputs, remove all RDYs etc.
+            newPorts = {}
+            for name in data["modules"][modName]["ports"]:
+                if name.startswith("__"):
+                    newPorts[name[2:]] = data["modules"][modName]["ports"][name]
+            newPorts["out"] = data["modules"][modName]["ports"]["out"]
+            data["modules"][modName]["ports"] = newPorts
+        elif isModule and isMinispec:
+            # Remove all RDYs from Minispec modules (they're always 1)
+            rdys = [name for name in data["modules"][modName]["ports"] if name.startswith("RDY_")]
+            for rdy in rdys:
+                del data["modules"][modName]["ports"][rdy]
+            # Remove all ENs that are unconnected (happen on inputs w/o defaults)
+            connectedNets = set()
+            cells = data["modules"][modName]["cells"]
+            for cellName in cells:
+                if "connections" in cells[cellName]:
+                    connections = cells[cellName]["connections"]
+                    for connection in connections:
+                        nets = connections[connection]
+                        for net in nets:
+                            connectedNets.add(net)
+            ens = [name for name in data["modules"][modName]["ports"] if name.startswith("EN_")]
+            deadEns = [en for en in ens if data["modules"][modName]["ports"][en]["bits"][0] not in connectedNets]
+            for en in deadEns:
+                del data["modules"][modName]["ports"][en]
+
+        f = open(jsonFile, "w")
+        json.dump(data, f)
+        f.close()
+
+        diagramFile = sanitizeParametric(args.target) + ".svg"
+        skinFile = os.path.join(scriptDir, "gates.svg")
+        run("netlistsvg %s -o %s --skin %s" % (jsonFile, diagramFile, skinFile))
+        print("\nProduced circuit diagram in %s" % (diagramFile,))
+
+    print("\nSynthesis complete")
