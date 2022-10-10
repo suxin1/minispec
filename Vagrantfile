@@ -24,10 +24,10 @@ Vagrant.configure("2") do |config|
   config.vm.provision "shell", inline: <<-SHELL
     # Packages
     export DEBIAN_FRONTEND=noninteractive
-    apt-get -y update
+    #     apt-get -y update
 
     # install and start v2ray
-    sudo -H /vagrant/proxy/v2ray_install.sh
+    sudo -H /vagrant/proxy/v2ray_install.sh -l /vagrant/proxy/v2ray-linux-64.zip
     sudo cp /vagrant/proxy/config.json /usr/local/etc/v2ray/config.json
     systemctl enable v2ray; systemctl start v2ray
     export http_proxy=http://127.0.0.1:10809
