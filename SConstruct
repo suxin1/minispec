@@ -63,8 +63,11 @@ grammarHdrs = getGrammarFiles(".h")
 grammarCpps = getGrammarFiles(".cpp")
 grammarOuts = grammarHdrs + grammarCpps
 env.Command(grammarOuts, grammarSrc,
-    "java -classpath %s -Xmx500M org.antlr.v4.Tool -o %s -Xexact-output-dir -Dlanguage=Cpp %s"
+    "java -cp ./%s -Xmx500M org.antlr.v4.Tool -o %s -Xexact-output-dir -Dlanguage=Cpp %s"
         % (antlrJar, buildDir, grammarSrc))
+# env.Command(grammarOuts, grammarSrc,
+#     "antlr4 -o %s -Xexact-output-dir -Dlanguage=Cpp %s"
+#         % (buildDir, grammarSrc))
 
 # Grammar-dependent auto-generated files
 genTokensProg = os.path.join(buildDir, "genTokens")
