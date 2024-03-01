@@ -8,13 +8,14 @@ end
 Vagrant.configure("2") do |config|
   config.vm.define "minispec"
   config.vm.hostname = "minispec"
-  config.vm.box = "bento/ubuntu-20.04"
+#   config.vm.box = "bento/ubuntu-20.04"
+  config.vm.box = "tknerr/baseimage-ubuntu-20.04"
 
-  config.vm.provider "vmware_desktop" do |vb|
+  config.vm.provider "docker" do |vb|
 #     vb.gui = true
 #     vb.name = "minispec"
-    vb.memory = "4096"
-    vb.cpus = total_cpus / 2
+#     vb.memory = "4096"
+#     vb.cpus = total_cpus / 2
 #     vb.default_nic_type = "virtio"
 #     vb.customize ["modifyvm", :id, "--paravirtprovider", "kvm"] # faster for linux guests
   end
@@ -63,6 +64,7 @@ Vagrant.configure("2") do |config|
     if [ ! -d ~vagrant/notebook-5.7.8 ]; then
       pip install --upgrade setuptools pip
       # Install jupyter notebook with minispec syntax patch
+      sudo chmod +x /vagrant/jupyter/install-jupyter.sh
       sudo -H -u vagrant /vagrant/jupyter/install-jupyter.sh
       # Link minispec kernel so it can be used as a module
       # (alternatively, change kernel def to include full path to minispeckerenel.py)
